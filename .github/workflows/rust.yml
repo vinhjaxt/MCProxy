@@ -20,28 +20,22 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Rust targets
-      run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-
-    - name: Install musl tools (amd64)
-      run: sudo apt-get update && sudo apt-get install -y musl-tools
+    - name: Install musl tools
+      run: |
+        rustup target add x86_64-unknown-linux-musl
+        sudo apt-get update && sudo apt-get install -y musl-tools
 
     - name: Build amd64 static binary
       run: |
         cargo build --release --target x86_64-unknown-linux-musl
         mv target/x86_64-unknown-linux-musl/release/mcproxy mcproxy-linux-amd64
 
-    - name: Install aarch64 musl cross-compiler
-      run: |
-        wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-        tar xzf aarch64-linux-musl-cross.tgz -C $HOME
-        echo "$HOME/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-
     - name: Build arm64 static binary
-      env:
-        CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
       run: |
-        cargo build --release --target aarch64-unknown-linux-musl
+        docker run --rm \
+          -v "$(pwd)":/home/rust/src \
+          messense/rust-musl-cross:aarch64-musl \
+          cargo build --release
         mv target/aarch64-unknown-linux-musl/release/mcproxy mcproxy-linux-arm64
 
     - name: Run tests
