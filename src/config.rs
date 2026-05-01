@@ -110,7 +110,15 @@ pub struct HttpServerConfig {
     /// Timeout in seconds for graceful shutdown (default: 5)
     #[serde(default = "default_shutdown_timeout", rename = "shutdownTimeout")]
     pub shutdown_timeout: u64,
-    
+
+    /// Unix socket path to listen on (overrides host/port if set)
+    #[serde(rename = "unixSocket")]
+    pub unix_socket: Option<String>,
+
+    /// File mode for unix socket as octal string, e.g. "0777" (chmod after bind)
+    #[serde(default, rename = "unixSocketMode")]
+    pub unix_socket_mode: Option<String>,
+
     /// Middleware configuration for request/response processing
     #[serde(default)]
     pub middleware: MiddlewareConfig,
@@ -144,6 +152,8 @@ impl Default for HttpServerConfig {
             cors_enabled: default_cors_enabled(),
             cors_origins: default_cors_origins(),
             shutdown_timeout: default_shutdown_timeout(),
+            unix_socket: None,
+            unix_socket_mode: None,
             middleware: MiddlewareConfig::default(),
         }
     }

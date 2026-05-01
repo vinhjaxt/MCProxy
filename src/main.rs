@@ -24,6 +24,7 @@
 //! connect to and HTTP server settings.
 
 use std::{env, sync::Arc};
+use std::os::unix::fs::PermissionsExt;
 
 use config::load_config;
 use proxy::ProxyServer;
@@ -34,6 +35,18 @@ mod error;
 mod http_server;
 mod proxy;
 mod middleware;
+
+/// Parse an octal permission mode string like "0777" or "0o660"
+fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let digits = if s.starts_with("0o") || s.starts_with("0O") {
+        &s[2..]
+    } else {
+        s
+    };
+    u32::from_str_radix(digits, 8)
+        .map_err(|e| format!("Invalid unix socket mode '{}': {}", s, e))
+}
 
 /// Apply environment variable overrides to the configuration
 fn apply_env_overrides(config: &mut config::McpConfig) {
@@ -96,6 +109,18 @@ fn apply_env_overrides(config: &mut config::McpConfig) {
                 warn!("Invalid MCPROXY_SHUTDOWN_TIMEOUT value: {}", timeout_str);
             }
         }
+
+        // Override unix socket path if MCPROXY_UNIX_SOCKET is set
+        if let Ok(socket_path) = env::var("MCPROXY_UNIX_SOCKET") {
+            info!("Overriding unix socket path from environment: {}", socket_path);
+            http_config.unix_socket = Some(socket_path);
+        }
+
+        // Override unix socket mode if MCPROXY_UNIX_SOCKET_MODE is set
+        if let Ok(mode_str) = env::var("MCPROXY_UNIX_SOCKET_MODE") {
+            info!("Overriding unix socket mode from environment: {}", mode_str);
+            http_config.unix_socket_mode = Some(mode_str);
+        }
     }
 }
 
@@ -141,22 +166,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .as_ref()
         .ok_or("HTTP server configuration is required")?;
 
-    let bind_addr = http_server::parse_bind_address(http_config)?;
-    info!("Binding HTTP server to {}", bind_addr);
-
     // Create HTTP server using the http_server module
     let app = http_server::create_router(shared_proxy.clone(), http_config);
 
-    info!("🚀 MCP Proxy HTTP Server listening on http://{}", bind_addr);
-    info!("   📡 MCP endpoint: http://{}/mcp", bind_addr);
-    info!("   🔍 Health check: http://{}/health", bind_addr);
     info!("   🔗 Connected to {} MCP servers", config.mcp_servers.len());
 
     // List connected servers with their tools
     let servers = shared_proxy.servers.read().await;
     for (name, server) in servers.iter() {
         info!("   └─ 🔌 {}", name);
-        
+
         // Display tools for each server
         if !server.tools.is_empty() {
             for tool in &server.tools {
@@ -168,9 +187,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     drop(servers);
 
-    // Start the HTTP server with graceful shutdown
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    
     // Set up graceful shutdown signal handler
     let shared_proxy_shutdown = shared_proxy.clone();
     let shutdown_signal = async move {
@@ -178,18 +194,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await
             .expect("Failed to install CTRL+C signal handler");
         info!("🛑 Received shutdown signal, gracefully shutting down...");
-        
+
         // Shutdown the proxy server and all connected MCP servers
         shared_proxy_shutdown.shutdown().await;
     };
-    
-    // Start server with graceful shutdown
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal);
-    
-    if let Err(e) = server.await {
-        error!("HTTP server error: {}", e);
+
+    if let Some(ref socket_path) = http_config.unix_socket {
+        // Unix socket mode
+        // Remove stale socket file
+        let _ = std::fs::remove_file(socket_path);
+
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+
+        // Apply chmod if configured
+        if let Some(ref mode_str) = http_config.unix_socket_mode {
+            let mode = parse_octal_mode(mode_str)
+                .map_err(|e| format!("{}", e))?;
+            std::fs::set_permissions(socket_path, PermissionsExt::from_mode(mode))?;
+            info!("🚀 MCP Proxy listening on unix://{} (mode {:o})", socket_path, mode);
+        } else {
+            info!("🚀 MCP Proxy listening on unix://{}", socket_path);
+        }
+        info!("   📡 MCP endpoint: unix://{}/mcp", socket_path);
+        info!("   🔍 Health check: unix://{}/health", socket_path);
+
+        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal);
+
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+        } else {
+            info!("✅ Server shutdown complete");
+        }
     } else {
-        info!("✅ Server shutdown complete");
+        // TCP mode
+        let bind_addr = http_server::parse_bind_address(http_config)?;
+        info!("Binding HTTP server to {}", bind_addr);
+
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+
+        info!("🚀 MCP Proxy HTTP Server listening on http://{}", bind_addr);
+        info!("   📡 MCP endpoint: http://{}/mcp", bind_addr);
+        info!("   🔍 Health check: http://{}/health", bind_addr);
+
+        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal);
+
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+        } else {
+            info!("✅ Server shutdown complete");
+        }
     }
 
     Ok(())
@@ -278,6 +331,8 @@ mod tests {
                     cors_enabled: self.cors_enabled.unwrap_or(true),
                     cors_origins: self.cors_origins.unwrap_or_else(|| vec!["*".to_string()]),
                     shutdown_timeout: self.shutdown_timeout.unwrap_or(5),
+                    unix_socket: None,
+                    unix_socket_mode: None,
                     middleware: config::MiddlewareConfig::default(),
                 }),
             };
@@ -299,6 +354,8 @@ mod tests {
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
             shutdown_timeout: 5,
+            unix_socket: None,
+            unix_socket_mode: None,
             middleware: config::MiddlewareConfig::default(),
         };
         http_server::create_router(shared_proxy, &test_config)
@@ -799,5 +856,344 @@ mod tests {
         assert!(body.get("id").is_none() || body["id"].is_null());
         assert!(body["result"].is_object());
         assert!(body.get("error").is_none());
+    }
+
+    #[test]
+    fn test_parse_octal_mode() {
+        assert_eq!(parse_octal_mode("0777").unwrap(), 0o777);
+        assert_eq!(parse_octal_mode("0o777").unwrap(), 0o777);
+        assert_eq!(parse_octal_mode("777").unwrap(), 0o777);
+        assert_eq!(parse_octal_mode("0660").unwrap(), 0o660);
+        assert_eq!(parse_octal_mode("0o660").unwrap(), 0o660);
+        assert_eq!(parse_octal_mode("  0777  ").unwrap(), 0o777);
+        assert!(parse_octal_mode("0999").is_err());
+        assert!(parse_octal_mode("abc").is_err());
+    }
+
+    // ── Unix socket integration tests ──────────────────────────────────
+
+    /// Send a raw HTTP/1.1 request over a Unix socket and return the response body.
+    /// Handles both Content-Length and chunked transfer encoding responses.
+    async fn http_get_over_unix(socket_path: &str, uri: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await
+            .expect("Failed to connect to Unix socket");
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            uri
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        // Don't shutdown write side — we need to read the response
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8(buf).unwrap();
+        extract_http_body(&response)
+    }
+
+    /// Send a raw HTTP/1.1 POST request over a Unix socket and return the response body.
+    async fn http_post_over_unix(socket_path: &str, uri: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await
+            .expect("Failed to connect to Unix socket");
+        let request = format!(
+            "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            uri, body.len(), body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        // Don't shutdown write side — we need to read the response
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8(buf).unwrap();
+        extract_http_body(&response)
+    }
+
+    /// Extract the body from a raw HTTP response, handling chunked transfer encoding.
+    fn extract_http_body(response: &str) -> String {
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap_or(("", response));
+
+        if headers.contains("Transfer-Encoding: chunked") {
+            // Decode chunked encoding
+            let mut decoded = String::new();
+            let mut remaining = body;
+            loop {
+                let (size_str, rest) = remaining.split_once("\r\n").unwrap_or(("", ""));
+                let chunk_size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+                if chunk_size == 0 {
+                    break;
+                }
+                let chunk_data = &rest[..chunk_size.min(rest.len())];
+                decoded.push_str(chunk_data);
+                remaining = &rest[chunk_size.min(rest.len())..];
+                // Skip trailing \r\n after chunk data
+                if remaining.starts_with("\r\n") {
+                    remaining = &remaining[2..];
+                }
+            }
+            decoded
+        } else {
+            body.to_string()
+        }
+    }
+
+    /// Spawn the server on a Unix socket. Returns the socket path.
+    /// The server shuts down when the `shutdown_tx` sender is dropped.
+    async fn spawn_unix_server(socket_path: String, mode: Option<String>) -> tokio::task::JoinHandle<()> {
+        let config = McpConfig {
+            mcp_servers: HashMap::new(),
+            http_server: Some(config::HttpServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0, // ignored — we use unix_socket
+                cors_enabled: true,
+                cors_origins: vec!["*".to_string()],
+                shutdown_timeout: 5,
+                unix_socket: Some(socket_path.clone()),
+                unix_socket_mode: mode.clone(),
+                middleware: config::MiddlewareConfig::default(),
+            }),
+        };
+
+        let proxy = ProxyServer::new(config).await.unwrap();
+        let shared_proxy = Arc::new(proxy);
+
+        let http_config = config::HttpServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            cors_enabled: true,
+            cors_origins: vec!["*".to_string()],
+            shutdown_timeout: 5,
+            unix_socket: Some(socket_path.clone()),
+            unix_socket_mode: mode,
+            middleware: config::MiddlewareConfig::default(),
+        };
+
+        let app = http_server::create_router(shared_proxy, &http_config);
+
+        // Remove stale socket
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        // Apply chmod if configured
+        if let Some(ref mode_str) = http_config.unix_socket_mode {
+            let mode = parse_octal_mode(mode_str).unwrap();
+            std::fs::set_permissions(&socket_path, PermissionsExt::from_mode(mode)).unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            });
+
+        let handle = tokio::spawn(async move {
+            let _ = server.await;
+            // Cleanup socket on shutdown
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        // Give the server a moment to start accepting connections
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Leak the shutdown_tx so caller can drop it to stop the server
+        // We return the handle; the server runs until the JoinHandle is aborted
+        std::mem::forget(shutdown_tx);
+
+        handle
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_health_check() {
+        let socket_path = format!("/tmp/mcproxy_test_health_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let handle = spawn_unix_server(socket_path.clone(), None).await;
+
+        let body = http_get_over_unix(&socket_path, "/health").await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["status"], "healthy");
+        assert_eq!(resp["service"], "mcproxy");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_ping() {
+        let socket_path = format!("/tmp/mcproxy_test_ping_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let handle = spawn_unix_server(socket_path.clone(), None).await;
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "ping"
+        }).to_string();
+
+        let body = http_post_over_unix(&socket_path, "/mcp", &request_body).await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 42);
+        assert!(resp["result"].is_object());
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_tools_list() {
+        let socket_path = format!("/tmp/mcproxy_test_tools_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let handle = spawn_unix_server(socket_path.clone(), None).await;
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }).to_string();
+
+        let body = http_post_over_unix(&socket_path, "/mcp", &request_body).await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert!(resp["result"]["tools"].is_array());
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_stale_file_cleanup() {
+        let socket_path = format!("/tmp/mcproxy_test_stale_{}.sock", std::process::id());
+
+        // Create a fake stale socket file (just a regular file)
+        std::fs::write(&socket_path, "stale").unwrap();
+        assert!(std::path::Path::new(&socket_path).exists());
+
+        // Spawning the server should clean it up and bind successfully
+        let handle = spawn_unix_server(socket_path.clone(), None).await;
+
+        // Server should be running — health check must work
+        let body = http_get_over_unix(&socket_path, "/health").await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["status"], "healthy");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_chmod_applied() {
+        let socket_path = format!("/tmp/mcproxy_test_chmod_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let handle = spawn_unix_server(socket_path.clone(), Some("0777".to_string())).await;
+
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o777);
+
+        // Also verify it actually works
+        let body = http_get_over_unix(&socket_path, "/health").await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["status"], "healthy");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_restricted_mode() {
+        let socket_path = format!("/tmp/mcproxy_test_restricted_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let handle = spawn_unix_server(socket_path.clone(), Some("0600".to_string())).await;
+
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_unix_socket_no_mode_default_permissions() {
+        let socket_path = format!("/tmp/mcproxy_test_nomode_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        // No unixSocketMode configured — should use process umask
+        let handle = spawn_unix_server(socket_path.clone(), None).await;
+
+        // Socket must exist and be usable
+        assert!(std::path::Path::new(&socket_path).exists());
+        let body = http_get_over_unix(&socket_path, "/health").await;
+        let resp: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp["status"], "healthy");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn test_config_parse_unix_socket() {
+        let json_data = r#"
+        {
+          "mcpServers": {},
+          "httpServer": {
+            "unixSocket": "/var/run/mcproxy.sock",
+            "unixSocketMode": "0660"
+          }
+        }
+        "#;
+
+        let config: McpConfig = serde_json::from_str(json_data).unwrap();
+        let http = config.http_server.as_ref().unwrap();
+        assert_eq!(http.unix_socket.as_deref(), Some("/var/run/mcproxy.sock"));
+        assert_eq!(http.unix_socket_mode.as_deref(), Some("0660"));
+        // host/port should be defaults
+        assert_eq!(http.host, "localhost");
+        assert_eq!(http.port, 8080);
+    }
+
+    #[test]
+    fn test_config_parse_no_unix_socket() {
+        let json_data = r#"
+        {
+          "mcpServers": {},
+          "httpServer": {
+            "host": "0.0.0.0",
+            "port": 9000
+          }
+        }
+        "#;
+
+        let config: McpConfig = serde_json::from_str(json_data).unwrap();
+        let http = config.http_server.as_ref().unwrap();
+        assert!(http.unix_socket.is_none());
+        assert!(http.unix_socket_mode.is_none());
+    }
+
+    #[test]
+    fn test_config_parse_unix_socket_mode_optional() {
+        let json_data = r#"
+        {
+          "mcpServers": {},
+          "httpServer": {
+            "unixSocket": "/tmp/mcproxy.sock"
+          }
+        }
+        "#;
+
+        let config: McpConfig = serde_json::from_str(json_data).unwrap();
+        let http = config.http_server.as_ref().unwrap();
+        assert_eq!(http.unix_socket.as_deref(), Some("/tmp/mcproxy.sock"));
+        assert!(http.unix_socket_mode.is_none());
     }
 }

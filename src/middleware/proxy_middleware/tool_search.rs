@@ -852,6 +852,8 @@ mod tests {
                     cors_enabled: true,
                     cors_origins: vec!["*".to_string()],
                     shutdown_timeout: 5,
+                    unix_socket: None,
+                    unix_socket_mode: None,
                     middleware: MiddlewareConfig {
                         proxy: vec![MiddlewareSpec {
                             middleware_type: "tool_search".to_string(),
@@ -875,6 +877,8 @@ mod tests {
                 cors_enabled: true,
                 cors_origins: vec!["*".to_string()],
                 shutdown_timeout: 5,
+                unix_socket: None,
+                unix_socket_mode: None,
                 middleware: MiddlewareConfig::default(),
             };
             http_server::create_router(shared_proxy, &test_config)
