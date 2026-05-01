@@ -331,11 +331,19 @@ impl ProxyServer {
                 server.name
             );
         } else if let Err(e) = prompts_result {
-            tracing::warn!(
-                "Failed to fetch prompts from server {}: {}",
-                server.name,
-                e
-            );
+            let err_str = format!("{}", e);
+            if err_str.contains("-32601") {
+                tracing::debug!(
+                    "Server {} does not support prompts",
+                    server.name
+                );
+            } else {
+                tracing::warn!(
+                    "Failed to fetch prompts from server {}: {}",
+                    server.name,
+                    e
+                );
+            }
         }
 
         // Process resources
@@ -347,11 +355,19 @@ impl ProxyServer {
                 server.name
             );
         } else if let Err(e) = resources_result {
-            tracing::warn!(
-                "Failed to fetch resources from server {}: {}",
-                server.name,
-                e
-            );
+            let err_str = format!("{}", e);
+            if err_str.contains("-32601") {
+                tracing::debug!(
+                    "Server {} does not support resources",
+                    server.name
+                );
+            } else {
+                tracing::warn!(
+                    "Failed to fetch resources from server {}: {}",
+                    server.name,
+                    e
+                );
+            }
         }
     }
 

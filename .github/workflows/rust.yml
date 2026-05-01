@@ -1,6 +1,7 @@
 name: Rust
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main" ]
   pull_request:
@@ -9,14 +10,50 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
+
+    - name: Install cross
+      run: |
+        curl -OL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz
+        tar xzvf cross-x86_64-unknown-linux-gnu.tar.gz
+        echo "$(pwd)" >> $GITHUB_PATH
+
+    - name: Build amd64 static binary
+      run: |
+        cross build --release --target x86_64-unknown-linux-musl
+        mv target/x86_64-unknown-linux-musl/release/mcproxy mcproxy-linux-amd64
+
+    - name: Build arm64 static binary
+      run: |
+        cross build --release --target aarch64-unknown-linux-musl
+        mv target/aarch64-unknown-linux-musl/release/mcproxy mcproxy-linux-arm64
+
     - name: Run tests
       run: cargo test --verbose
+
+    - name: Generate release tag
+      if: github.event_name != 'pull_request'
+      id: tag
+      run: |
+        sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+        sudo date -s "$(wget -qSO- --max-redirect=0 google.com 2>&1 | grep Date: | cut -d' ' -f5-8)Z"
+        echo "release_tag=Release_$(date +"%Y.%m.%d_%H-%M-%S")" >> $GITHUB_OUTPUT
+        echo "release_hash=$(git log --format="%H" -n 1)" >> $GITHUB_OUTPUT
+
+    - name: Release
+      if: github.event_name != 'pull_request'
+      uses: softprops/action-gh-release@v1
+      with:
+        body: ${{ steps.tag.outputs.release_hash }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        files: |
+          ./mcproxy-linux-amd64
+          ./mcproxy-linux-arm64

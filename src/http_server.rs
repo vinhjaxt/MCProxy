@@ -399,7 +399,16 @@ async fn route_mcp_method(
                 next_cursor: None,
             })
         }
-        
+
+        "resources/templates/list" => {
+            Ok(serde_json::json!({ "resourceTemplates": [] }))
+        }
+
+        m if m.starts_with("notifications/") => {
+            tracing::debug!("Received MCP notification: {}", method);
+            Ok(serde_json::json!({}))
+        }
+
         _ => {
             warn!("Unknown MCP method: {}", method);
             Err(McpError::invalid_params(format!("Unknown method: {}", method), None))

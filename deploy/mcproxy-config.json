@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "1": {
+      "url": "https://mcp.exa.ai/mcp"
+    },
+    "2": {
+      "command": "deno",
+      "args": ["x", "mcp-fetch-server"],
+      "env": {
+        "DEFAULT_LIMIT": "51200"
+      }
+    }
+  },
+  "httpServer": {
+    "host": "[::]",
+    "port": 8080,
+    "corsEnabled": true,
+    "corsOrigins": ["*"],
+    "shutdownTimeout": 5,
+    "middleware": {
+      "proxy": [
+        {
+          "type": "description_enricher",
+          "enabled": true,
+          "config": {
+            "suffix": "",
+            "overrides": {
+              "2___fetch_readable": "Fetch a website and return its main content parsed by Mozilla Readability, converted to Markdown. Strips away navigation, ads, and boilerplate. Ideal for articles and blog posts. Use after `1___web_search_exa` when highlights are insufficient or to read any URL.\n\nBest for: Extracting full content from known URLs. Batch multiple URLs in one call.\nReturns: Clean text content and metadata from the page(s).",
+              "1___web_search_exa": "Search the web for any topic and get clean, ready-to-use content.\n\n      Best for: Finding current information, news, facts, people, companies, or answering questions about any topic.\n      Returns: Clean text content from top search results.\n\n      Query tips:\n      describe the ideal page, not keywords. \"blog post comparing React and Vue performance\" not \"React vs Vue\".\n      Use category:people / category:company to search through Linkedin profiles / companies respectively.\n      If highlights are insufficient, follow up with `2___fetch_readable` on the best URLs."
+            }
+          }
+        }
+      ],
+      "client": {
+        "servers": {
+          "1": [
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "disallow": "^(web_fetch_exa|fetch_markdown)$"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
