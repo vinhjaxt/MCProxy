@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "memory-server": {
+      "command": "mcp-server-memory",
+      "args": [],
+      "env": {}
+    }
+  },
+  "httpServer": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "corsEnabled": true,
+    "corsOrigins": ["*"],
+    "shutdownTimeout": 5,
+    "middleware": {
+      "proxy": [
+        {
+          "type": "tool_search",
+          "enabled": true,
+          "config": {
+            "maxToolsLimit": 50,
+            "searchThreshold": 0.1
+          }
+        }
+      ]
+    }
+  }
+}
